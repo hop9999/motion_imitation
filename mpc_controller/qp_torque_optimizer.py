@@ -75,21 +75,24 @@ def compute_objective_matrix(mass_matrix, desired_acc, acc_weight, reg_weight):
   return quad_term, linear_term
 
 
-def compute_contact_force(robot,
+def compute_contact_force(MPC_BODY_MASS,
+                          MPC_BODY_INERTIA,
                           desired_acc,
                           contacts,
+                          foot_position,
                           acc_weight=ACC_WEIGHT,
-                          reg_weight=1e-4,
+                          reg_weight=0*1e-4,
                           friction_coef=0.45,
                           f_min_ratio=0.1,
                           f_max_ratio=10.):
+                          
   mass_matrix = compute_mass_matrix(
-      robot.MPC_BODY_MASS,
-      np.array(robot.MPC_BODY_INERTIA).reshape((3, 3)),
-      robot.GetFootPositionsInBaseFrame())
+      MPC_BODY_MASS,
+      np.array(MPC_BODY_INERTIA).reshape((3, 3)),
+      foot_position)
   G, a = compute_objective_matrix(mass_matrix, desired_acc, acc_weight,
                                   reg_weight)
-  C, b = compute_constraint_matrix(robot.MPC_BODY_MASS, contacts,
+  C, b = compute_constraint_matrix(MPC_BODY_MASS, contacts,
                                    friction_coef, f_min_ratio, f_max_ratio)
   G += 1e-4 * np.eye(12)
   result = quadprog.solve_qp(G, a, C, b)

@@ -4,6 +4,8 @@ import inspect
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(os.path.dirname(currentdir))
 os.sys.path.insert(0, parentdir)
+import scipy.linalg as la
+
 
 from absl import app
 from absl import flags
@@ -23,10 +25,9 @@ from mpc_controller import gait_generator as gait_generator_lib
 from mpc_controller import locomotion_controller
 from mpc_controller import openloop_gait_generator
 from mpc_controller import raibert_swing_leg_controller
-#from mpc_controller import torque_stance_leg_controller
-#import mpc_osqp
-from mpc_controller import torque_stance_leg_controller_quadprog as torque_stance_leg_controller
-
+#from mpc_controller import torque_stance_leg_coontroller
+from mpc_controller import qp_torque_optimizer
+from mpc_controller import torque_stance_leg_controller_lqr as torque_stance_leg_controller
 
 from motion_imitation.robots import a1
 from motion_imitation.robots import robot_config
@@ -38,7 +39,7 @@ flags.DEFINE_bool("use_gamepad", False,
 flags.DEFINE_bool("use_real_robot", False,
                   "whether to use real robot or simulation")
 flags.DEFINE_bool("show_gui", True, "whether to show GUI.")
-flags.DEFINE_float("max_time_secs", 1., "maximum time to run the robot.")
+flags.DEFINE_float("max_time_secs", 15.4, "maximum time to run the robot.")
 FLAGS = flags.FLAGS
 
 _NUM_SIMULATION_ITERATION_STEPS = 300
@@ -49,15 +50,15 @@ _STANCE_DURATION_SECONDS = [
 ] * 4  # For faster trotting (v > 1.5 ms reduce this to 0.13s).
 
 # Standing
-# _DUTY_FACTOR = [1.] * 4
-# _INIT_PHASE_FULL_CYCLE = [0., 0., 0., 0.]
+_DUTY_FACTOR = [1.] * 4
+_INIT_PHASE_FULL_CYCLE = [0., 0., 0., 0.]
 
-# _INIT_LEG_STATE = (
-#     gait_generator_lib.LegState.STANCE,
-#     gait_generator_lib.LegState.STANCE,
-#     gait_generator_lib.LegState.STANCE,
-#     gait_generator_lib.LegState.STANCE,
-# )
+_INIT_LEG_STATE = (
+    gait_generator_lib.LegState.STANCE,
+    gait_generator_lib.LegState.STANCE,
+    gait_generator_lib.LegState.STANCE,
+    gait_generator_lib.LegState.STANCE,
+)
 
 # Tripod
 # _DUTY_FACTOR = [.8] * 4
@@ -71,16 +72,15 @@ _STANCE_DURATION_SECONDS = [
 # )
 
 # Trotting
-_DUTY_FACTOR = [0.6] * 4
-_INIT_PHASE_FULL_CYCLE = [0.9, 0, 0, 0.9]
-
-_INIT_LEG_STATE = (
-    gait_generator_lib.LegState.SWING,
-    gait_generator_lib.LegState.STANCE,
-    gait_generator_lib.LegState.STANCE,
-    gait_generator_lib.LegState.SWING,
-)
-
+#_DUTY_FACTOR = [0.6] * 4
+#_INIT_PHASE_FULL_CYCLE = [0.9, 0, 0, 0.9]
+#
+#_INIT_LEG_STATE = (
+#    gait_generator_lib.LegState.SWING,
+#    gait_generator_lib.LegState.STANCE,
+#    gait_generator_lib.LegState.STANCE,
+#    gait_generator_lib.LegState.SWING,
+#)
 
 def _generate_example_linear_angular_speed(t):
   """Creates an example speed profile based on time for demo purpose."""
@@ -88,15 +88,15 @@ def _generate_example_linear_angular_speed(t):
   vy = 0.2
   wz = 0.8
 
-  time_points = (0, 5, 10, 15, 20, 25, 30)
-  speed_points = ((0, 0, 0, 0), (0, 0, 0, wz), (vx, 0, 0, 0), (0, 0, 0, -wz),
-                  (0, -vy, 0, 0), (0, 0, 0, 0), (0, 0, 0, wz))
+  time_points = (0, 2, 4, 6, 8)
+  speed_points = ((0.0, 0, 0, 0), (0.0, 0, 0, 0), (0.5, 0, 0, 0), (2.0, 0, 0, 0), (0.5, 0, 0, 0))
 
-  speed = scipy.interpolate.interp1d(time_points,
+  speed_array = scipy.interpolate.interp1d(time_points,
                                      speed_points,
                                      kind="previous",
                                      fill_value="extrapolate",
-                                     axis=0)(t)
+                                     axis=0)
+  speed = speed_array(t)
 
   return speed[0:3], speed[3], False
 
@@ -127,11 +127,7 @@ def _setup_controller(robot):
   st_controller = torque_stance_leg_controller.TorqueStanceLegController(
       robot,
       gait_generator,
-      state_estimator,
-      desired_speed=desired_speed,
-      desired_twisting_speed=desired_twisting_speed,
-      desired_body_height=robot.MPC_BODY_HEIGHT
-      #,qp_solver = mpc_osqp.QPOASES #or mpc_osqp.OSQP
+      state_estimator
       )
 
   controller = locomotion_controller.LocomotionController(
@@ -143,13 +139,23 @@ def _setup_controller(robot):
       clock=robot.GetTimeSinceReset)
   return controller
 
+def sin_height_traj(t):
+  ampl = 0.04
+  w = 0.2
+  omega = 2*np.pi*w
+  state = np.zeros((12,1))
+  accel = np.zeros((6,1))
+  state[0,0] = 0.5*ampl*np.sin(omega*t) + 0.0*np.tanh(1*t)
+  state[6,0] = 0.5*omega*ampl*np.cos(omega*t)
+  state[2,0] = 0.24+ampl*np.sin(omega*t) + 0.0*np.tanh(1*t)
+  state[8,0] = omega*ampl*np.cos(omega*t)
+  accel[2,0] = -omega*omega*ampl*np.sin(omega*t)
+  return state, accel
 
-def _update_controller_params(controller, lin_speed, ang_speed):
+def _update_controller_params(controller, lin_speed, ang_speed, q):
   controller.swing_leg_controller.desired_speed = lin_speed
   controller.swing_leg_controller.desired_twisting_speed = ang_speed
-  controller.stance_leg_controller.desired_speed = lin_speed
-  controller.stance_leg_controller.desired_twisting_speed = ang_speed
-
+  controller.stance_leg_controller.desired_q = q
 
 def main(argv):
   """Runs the locomotion controller example."""
@@ -161,11 +167,45 @@ def main(argv):
   else:
     p = bullet_client.BulletClient(connection_mode=pybullet.DIRECT)
   p.setPhysicsEngineParameter(numSolverIterations=30)
-  p.setTimeStep(0.001)
+  p.setTimeStep(0.002)
   p.setGravity(0, 0, -9.8)
   p.setPhysicsEngineParameter(enableConeFriction=0)
   p.setAdditionalSearchPath(pybullet_data.getDataPath())
   p.loadURDF("plane.urdf")
+
+  # Construct trajectory
+
+  contact_point_positions = np.array([[ 0.17,  -0.134, 0],
+                                      [ 0.17,   0.13,  0],
+                                      [-0.183, -0.134, 0],
+                                      [-0.183,  0.13,  0]])
+  
+  K_gains = []
+  react_forces = []
+
+  time_array = np.linspace(0,FLAGS.max_time_secs, 50)
+  for t in time_array:
+    des_q, des_accel = sin_height_traj(t)
+    T = np.vstack((np.hstack((np.eye(3).T,-des_q[0:3,:])),np.hstack((np.zeros((1,3)),np.eye(1)))))
+    cont_point_ext = np.vstack((contact_point_positions.T,np.ones((1,4))))
+    foot_position_ext = T @ cont_point_ext
+
+    foot_position = foot_position_ext[0:3,:].T
+    contacts = np.ones(4)
+
+    K_gain, force_des = torque_stance_leg_controller.prepare_point(contacts, foot_position, des_accel[:,0])
+    K_gains.append(K_gain)
+    react_forces.append(force_des)
+
+  K_array = scipy.interpolate.interp1d(time_array,
+                                     K_gains,
+                                     kind="cubic",
+                                     axis=0)
+
+  react_forces_array = scipy.interpolate.interp1d(time_array,
+                                     react_forces,
+                                     kind="cubic",
+                                     axis=0)
 
   # Construct robot class:
   if FLAGS.use_real_robot:
@@ -174,14 +214,14 @@ def main(argv):
         pybullet_client=p,
         motor_control_mode=robot_config.MotorControlMode.HYBRID,
         enable_action_interpolation=False,
-        time_step=0.002,
+        time_step=0.02,
         action_repeat=1)
   else:
     robot = a1.A1(p,
                   motor_control_mode=robot_config.MotorControlMode.HYBRID,
                   enable_action_interpolation=False,
                   reset_time=2,
-                  time_step=0.002,
+                  time_step=0.02,
                   action_repeat=1)
 
   controller = _setup_controller(robot)
@@ -201,31 +241,44 @@ def main(argv):
   start_time = robot.GetTimeSinceReset()
   current_time = start_time
   com_vels, imu_rates, actions = [], [], []
+
+  
+  
   while current_time - start_time < FLAGS.max_time_secs:
     #time.sleep(0.0008) #on some fast computer, works better with sleep on real A1?
     start_time_robot = current_time
     start_time_wall = time.time()
     # Updates the controller behavior parameters.
     lin_speed, ang_speed, e_stop = command_function(current_time)
+    des_q,des_ddq = sin_height_traj(current_time)
+    controller.stance_leg_controller.K_gain = K_array(current_time)
+    controller.stance_leg_controller.force_des = react_forces_array(current_time)
     # print(lin_speed)
     if e_stop:
       logging.info("E-stop kicked, exiting...")
       break
-    _update_controller_params(controller, lin_speed, ang_speed)
+    _update_controller_params(controller, lin_speed, ang_speed, des_q)
     controller.update()
-    hybrid_action, _ = controller.get_action()
+    try:
+      hybrid_action, _ = controller.get_action()
+    except RuntimeError as inst:
+      print(inst)
+      break
+    
     com_vels.append(np.array(robot.GetBaseVelocity()).copy())
     imu_rates.append(np.array(robot.GetBaseRollPitchYawRate()).copy())
     actions.append(hybrid_action)
     robot.Step(hybrid_action)
     current_time = robot.GetTimeSinceReset()
 
+    #actual_duration = time.time() - start_time_wall
+    #print("actual_duration=", current_time)
     if not FLAGS.use_real_robot:
       expected_duration = current_time - start_time_robot
       actual_duration = time.time() - start_time_wall
       if actual_duration < expected_duration:
         time.sleep(expected_duration - actual_duration)
-    print("actual_duration=", actual_duration)
+    print("actual_duration=", time.time() - start_time_wall)
   if FLAGS.use_gamepad:
     gamepad.stop()
 
@@ -235,7 +288,6 @@ def main(argv):
              com_vels=com_vels,
              imu_rates=imu_rates)
     logging.info("logged to: {}".format(logdir))
-
 
 if __name__ == "__main__":
   app.run(main)
